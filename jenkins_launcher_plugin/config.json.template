@@ -1,0 +1,29 @@
+{
+  "default_environment": "dev",
+  "environments": {
+    "dev": {
+      "name": "DEV 开发环境",
+      "jenkins_url": "${JENKINS_DEV_URL}",
+      "username": "${JENKINS_DEV_USERNAME}",
+      "api_token": "${JENKINS_DEV_API_TOKEN}",
+      "views": [],
+      "pinned_jobs": [],
+      "cache_duration_seconds": 600,
+      "verify_ssl": true,
+      "timeout": 5,
+      "require_confirm": false
+    },
+    "prod": {
+      "name": "PROD 生产环境",
+      "jenkins_url": "${JENKINS_PROD_URL}",
+      "username": "${JENKINS_PROD_USERNAME}",
+      "api_token": "${JENKINS_PROD_API_TOKEN}",
+      "views": [],
+      "pinned_jobs": [],
+      "cache_duration_seconds": 300,
+      "verify_ssl": true,
+      "timeout": 5,
+      "require_confirm": true
+    }
+  }
+}

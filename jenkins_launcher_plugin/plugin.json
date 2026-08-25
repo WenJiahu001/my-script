@@ -1,0 +1,12 @@
+{
+  "ID": "d3b07384-d113-4c9c-8517-742a78f24419",
+  "ActionKeyword": "jk",
+  "Name": "Jenkins 一键构建",
+  "Description": "快速检索并一键触发 Jenkins 项目默认参数构建",
+  "Author": "Antigravity",
+  "Version": "1.0.0",
+  "Language": "python",
+  "Website": "https://github.com",
+  "ExecuteFileName": "main.py",
+  "IcoPath": "Images/icon.png"
+}

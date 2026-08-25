@@ -1,0 +1,7 @@
+config.json
+history.json
+history.json.lock
+cache_*.json
+plugin_debug.log
+__pycache__/
+.refresh_*.lock

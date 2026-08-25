@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Flow Launcher 插件本地私有配置与缓存 (防止泄露 Token)
+jenkins_launcher_plugin/config.json
+jenkins_launcher_plugin/cache_*.json
+jenkins_launcher_plugin/history.json
+jenkins_launcher_plugin/plugin_debug.log
+*.log
+
+# IDE & OS
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini
