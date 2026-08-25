@@ -147,6 +147,37 @@ class ConfigAndClientTests(unittest.TestCase):
         with patch("jenkins_client.is_env_configured", return_value=(True, "已配置")), patch("jenkins_client.load_views_cache", return_value=cached_views):
             self.assertEqual(client.get_remote_views(), cached_views)
 
+    def test_cache_miss_starts_background_refresh_without_blocking(self):
+        client = JenkinsClient.__new__(JenkinsClient)
+        client.env_key, client.env_name = "dev", "DEV"
+        with patch("jenkins_client.is_env_configured", return_value=(True, "已配置")), patch("jenkins_client.load_cache", return_value=None), patch("jenkins_client.JenkinsManager.refresh_in_background") as refresh:
+            success, message = client.get_jobs()
+        self.assertFalse(success)
+        self.assertIn("后台同步", message)
+        refresh.assert_called_once_with("dev")
+
+    @unittest.skipUnless(os.name == "nt", "仅验证 Windows 打开配置行为")
+    def test_open_config_uses_notepad_for_deterministic_file_opening(self):
+        launcher = JenkinsLauncher.__new__(JenkinsLauncher)
+        with patch("main.get_config_path", return_value=r"C:\\temp\\config.json"), patch("main.os.path.exists", return_value=True), patch("main.subprocess.Popen") as popen:
+            launcher.open_config()
+        self.assertEqual(popen.call_args.args[0], ["notepad.exe", r"C:\\temp\\config.json"])
+
+    def test_refresh_cache_reports_successful_job_count(self):
+        launcher = JenkinsLauncher.__new__(JenkinsLauncher)
+        launcher.manager = type("Manager", (), {"get_jobs_for_env": lambda self, env, force_refresh: (True, [{}, {}])})()
+        with patch("main.clear_cache", return_value=True), patch("main.get_env_config", return_value={"name": "BETA"}), patch.object(launcher, "_show_message") as notify:
+            launcher.refresh_cache("beta")
+        notify.assert_called_once_with("Jenkins 缓存刷新成功", "【BETA】已同步，共获取 2 个流水线。")
+
+    def test_refresh_cache_reports_sync_failure(self):
+        launcher = JenkinsLauncher.__new__(JenkinsLauncher)
+        launcher.manager = type("Manager", (), {"get_all_jobs": lambda self, force_refresh: (False, "网络超时")})()
+        with patch("main.clear_cache", return_value=True), patch.object(launcher, "_show_message") as notify:
+            launcher.refresh_cache("")
+        self.assertEqual(notify.call_args.args[0], "Jenkins 缓存刷新失败")
+        self.assertIn("网络超时", notify.call_args.args[1])
+
 
 if __name__ == "__main__":
     unittest.main()

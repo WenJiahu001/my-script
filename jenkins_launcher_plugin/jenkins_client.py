@@ -180,7 +180,10 @@ class JenkinsClient:
             if stale is not None:
                 JenkinsManager.refresh_in_background(self.env_key)
                 return True, stale
-        return JenkinsManager.fetch_jobs_once(self)
+            # 首次同步也放入后台，避免 Flow Launcher 每次键入都阻塞等待 Jenkins。
+            JenkinsManager.refresh_in_background(self.env_key)
+            return False, f"[{self.env_name}] 正在后台同步流水线列表，请稍后重试"
+        return self._fetch_jobs()
 
     def _get_parameter_definitions(self, job_url: str) -> tuple[bool, list[dict]]:
         """返回 (读取成功, 参数定义)，读取失败时必须阻止默认构建。"""
@@ -241,34 +244,8 @@ class JenkinsManager:
         return self._clients[env_key]
 
     @classmethod
-    def fetch_jobs_once(cls, client: JenkinsClient) -> tuple[bool, list[dict] | str]:
-        """缓存缺失时合并并发查询，避免输入过程触发多次全量 Jenkins 请求。"""
-        os.makedirs(DATA_DIR, exist_ok=True)
-        lock_id = hashlib.sha256(f"jobs:{client.env_key}".encode("utf-8")).hexdigest()[:16]
-        lock_path = os.path.join(DATA_DIR, f".jobs_{lock_id}.lock")
-        try:
-            fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            os.close(fd)
-        except FileExistsError:
-            # 等待正在拉取的进程写完缓存；不再重复发出相同的 /view、/job 请求。
-            deadline = time.monotonic() + client.timeout + 1
-            while time.monotonic() < deadline:
-                cached = load_cache(client.env_key)
-                if cached is not None:
-                    return True, cached
-                time.sleep(0.05)
-            return False, f"[{client.env_name}] 正在同步流水线列表，请稍后重试"
-        try:
-            return client._fetch_jobs()
-        finally:
-            try:
-                os.unlink(lock_path)
-            except FileNotFoundError:
-                pass
-
-    @classmethod
     def refresh_in_background(cls, env_key: str) -> None:
-        """过期缓存立即可用，同时由独立进程刷新，避免阻塞搜索框。"""
+        """后台刷新，锁占用或失效时立即返回，绝不阻塞 Flow 搜索进程。"""
         os.makedirs(DATA_DIR, exist_ok=True)
         lock_id = hashlib.sha256(str(env_key).encode("utf-8")).hexdigest()[:16]
         lock_path = os.path.join(DATA_DIR, f".refresh_{lock_id}.lock")
@@ -277,8 +254,8 @@ class JenkinsManager:
             os.close(fd)
         except FileExistsError:
             try:
-                # 后台进程异常退出后允许回收旧锁，避免永久停止刷新。
-                if os.path.getmtime(lock_path) < time.time() - 120:
+                # 单次同步最长受 timeout 与 Folder 数量影响；30 秒后视为异常遗留。
+                if os.path.getmtime(lock_path) < time.time() - 30:
                     os.unlink(lock_path)
                     return cls.refresh_in_background(env_key)
             except FileNotFoundError:

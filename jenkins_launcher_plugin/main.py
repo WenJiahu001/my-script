@@ -1,8 +1,10 @@
 import ctypes
+import inspect
 import json
 import os
 import subprocess
 import sys
+import traceback
 from typing import Any
 import webbrowser
 
@@ -20,7 +22,46 @@ from config import (
     is_env_configured,
     load_config,
 )
-from flowlauncher import FlowLauncher, log_debug
+# Flow 的 runpy 启动方式不会稳定地把插件目录加入 sys.path，因此协议层内置于入口。
+def log_debug(message: str) -> None:
+    try:
+        log_path = os.path.join(os.environ.get("APPDATA", CURRENT_DIR), "FlowLauncher", "JenkinsLauncher", "plugin_debug.log")
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+        with open(log_path, "a", encoding="utf-8") as log_file:
+            log_file.write(f"{message}\n")
+    except OSError:
+        pass
+
+
+def _parse_flow_request(raw_arg: str) -> dict:
+    try:
+        request = json.loads(raw_arg)
+        return request if isinstance(request, dict) and "method" in request else {"method": "query", "parameters": [raw_arg]}
+    except json.JSONDecodeError:
+        return {"method": "query", "parameters": [raw_arg]}
+
+
+class FlowLauncher:
+    """自包含 JSON-RPC 协议层，不依赖插件目录的额外 Python 模块。"""
+    def __init__(self):
+        if hasattr(sys.stdout, "reconfigure"):
+            try:
+                sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+            except OSError:
+                pass
+        try:
+            request = _parse_flow_request(sys.argv[1]) if len(sys.argv) > 1 else {"method": "query", "parameters": [""]}
+            name, params = request.get("method", "query"), request.get("parameters", [])
+            method = getattr(self, name, None) if isinstance(name, str) and not name.startswith("_") else None
+            if not callable(method):
+                method, params = self.query, [str(sys.argv[1]) if len(sys.argv) > 1 else ""]
+            params = params if isinstance(params, list) else []
+            count = len([p for p in inspect.signature(method).parameters.values() if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)])
+            params = params[:count] + [""] * max(0, count - len(params))
+            print(json.dumps({"result": method(*params) or []}, ensure_ascii=False))
+        except Exception as error:
+            log_debug(traceback.format_exc())
+            print(json.dumps({"result": [{"Title": "Jenkins 插件执行异常", "SubTitle": str(error), "IcoPath": "Images/failed.png"}]}, ensure_ascii=False))
 from history import get_job_weight, load_history, record_job_trigger
 from jenkins_client import JenkinsManager
 
@@ -192,14 +233,15 @@ class JenkinsLauncher(FlowLauncher):
             current_env_title = env_cfg.get("name", target_mode.upper())
 
         if not success:
+            is_syncing = "正在后台同步" in str(jobs_or_err)
             error_res = [
                 {
-                    "Title": f"无法获取 {current_env_title} 的流水线列表",
-                    "SubTitle": f"错误: {jobs_or_err} (回车打开配置文件修改)",
+                    "Title": f"正在同步 {current_env_title} 的流水线列表" if is_syncing else f"无法获取 {current_env_title} 的流水线列表",
+                    "SubTitle": "首次同步已在后台开始，稍后再次输入 jk 即可查看结果。" if is_syncing else f"错误: {jobs_or_err} (回车打开配置文件修改)",
                     "IcoPath": self._get_setting_icon(),
                     "JsonRPCAction": {
-                        "method": "open_config",
-                        "parameters": [],
+                        "method": "refresh_cache" if is_syncing else "open_config",
+                        "parameters": [target_mode] if is_syncing else [],
                         "dontHideAfterAction": False,
                     },
                     "ContextData": [target_mode, "", "error"],
@@ -435,7 +477,8 @@ class JenkinsLauncher(FlowLauncher):
         if success:
             record_job_trigger(env_key, job_url_or_name, name_str)
 
-        clear_cache(env_key)
+        # 保留旧缓存以便下一次搜索立即可用；后台刷新成功后会原子替换它。
+        # 缓存不存在时无需清理。
 
         if os.name == "nt":
             try:
@@ -449,6 +492,17 @@ class JenkinsLauncher(FlowLauncher):
                     ctypes.windll.user32.MessageBoxW(0, msg_text, title, 0x10)
             except Exception as e:
                 log_debug(f"[build_job] 弹窗通知异常: {e}")
+
+    @staticmethod
+    def _show_message(title: str, message: str, icon: int = 0x40) -> None:
+        """显示 Windows 通知；失败时仅记录日志，不影响主操作。"""
+        log_debug(f"[notify] {title}: {message}")
+        if os.name != "nt":
+            return
+        try:
+            ctypes.windll.user32.MessageBoxW(0, message, title, icon)
+        except Exception as error:
+            log_debug(f"[notify] 弹窗失败: {error}")
 
     def open_browser(self, url: str) -> None:
         """在默认浏览器打开 URL (采用 Windows 原生 ShellExecute)"""
@@ -470,26 +524,41 @@ class JenkinsLauncher(FlowLauncher):
                 log_debug(f"[open_browser] webbrowser.open 亦异常: {e2}")
 
     def open_config(self) -> None:
-        """打开配置文件"""
+        """使用记事本直接打开主配置，避免 .json 文件关联导致动作无响应。"""
         cfg_path = get_config_path()
         if not os.path.exists(cfg_path):
             load_config()
         log_debug(f"[open_config] 准备打开配置文件: {cfg_path}")
         try:
             if os.name == "nt":
-                os.startfile(cfg_path)
+                subprocess.Popen(
+                    ["notepad.exe", cfg_path],
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                    close_fds=True,
+                )
             else:
                 webbrowser.open(cfg_path)
-        except Exception:
-            if os.name == "nt":
-                subprocess.Popen(["notepad.exe", cfg_path])
+        except OSError as error:
+            log_debug(f"[open_config] 打开配置文件失败: {error}")
 
     def refresh_cache(self, env_key: str | None = None) -> None:
-        clear_cache(env_key)
-        if env_key:
-            self.manager.get_jobs_for_env(env_key, force_refresh=True)
+        """清理缓存后同步 Jenkins，并向用户反馈实际结果。"""
+        target_env = env_key if env_key and env_key != "all" else None
+        target_name = (get_env_config(target_env) or {}).get("name", target_env.upper()) if target_env else "全部环境"
+        if not clear_cache(target_env):
+            self._show_message("Jenkins 缓存刷新失败", f"无法清理【{target_name}】的本地缓存。", 0x10)
+            return
+
+        if target_env:
+            success, jobs_or_error = self.manager.get_jobs_for_env(target_env, force_refresh=True)
         else:
-            self.manager.get_all_jobs(force_refresh=True)
+            success, jobs_or_error = self.manager.get_all_jobs(force_refresh=True)
+
+        if success:
+            job_count = len(jobs_or_error) if isinstance(jobs_or_error, list) else 0
+            self._show_message("Jenkins 缓存刷新成功", f"【{target_name}】已同步，共获取 {job_count} 个流水线。")
+        else:
+            self._show_message("Jenkins 缓存刷新失败", f"【{target_name}】缓存已清理，但同步失败：\n{jobs_or_error}", 0x10)
 
 
 if __name__ == "__main__":
