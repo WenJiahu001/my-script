@@ -64,6 +64,7 @@ class FlowLauncher:
             print(json.dumps({"result": [{"Title": "Jenkins 插件执行异常", "SubTitle": str(error), "IcoPath": "Images/failed.png"}]}, ensure_ascii=False))
 from history import get_job_weight, load_history, record_job_trigger
 from jenkins_client import JenkinsManager
+from windows_notifications import show_notification
 
 
 class JenkinsLauncher(FlowLauncher):
@@ -476,33 +477,27 @@ class JenkinsLauncher(FlowLauncher):
 
         if success:
             record_job_trigger(env_key, job_url_or_name, name_str)
+            queue_url = getattr(client, "last_queue_url", "")
+            tracking_started = JenkinsManager.start_build_tracking(env_key, name_str, queue_url)
+            if tracking_started:
+                message = f"{message}\n已提交 Jenkins 队列，正在后台跟踪最终结果。"
+            elif not queue_url:
+                message = f"{message}\nJenkins 未返回队列地址，无法跟踪最终结果。"
+            else:
+                message = f"{message}\n后台跟踪进程启动失败，请在 Jenkins 页面查看最终结果。"
 
         # 保留旧缓存以便下一次搜索立即可用；后台刷新成功后会原子替换它。
         # 缓存不存在时无需清理。
 
-        if os.name == "nt":
-            try:
-                if success:
-                    title = f"Jenkins 构建触发成功"
-                    msg_text = f"【{env_name}】项目 [{name_str}]\n{message}"
-                    ctypes.windll.user32.MessageBoxW(0, msg_text, title, 0x40)
-                else:
-                    title = f"Jenkins 构建触发失败"
-                    msg_text = f"【{env_name}】项目 [{name_str}]\n{message}"
-                    ctypes.windll.user32.MessageBoxW(0, msg_text, title, 0x10)
-            except Exception as e:
-                log_debug(f"[build_job] 弹窗通知异常: {e}")
+        title = "Jenkins 构建触发成功" if success else "Jenkins 构建触发失败"
+        self._show_message(title, f"【{env_name}】项目 [{name_str}]\n{message}")
 
     @staticmethod
     def _show_message(title: str, message: str, icon: int = 0x40) -> None:
         """显示 Windows 通知；失败时仅记录日志，不影响主操作。"""
         log_debug(f"[notify] {title}: {message}")
-        if os.name != "nt":
-            return
-        try:
-            ctypes.windll.user32.MessageBoxW(0, message, title, icon)
-        except Exception as error:
-            log_debug(f"[notify] 弹窗失败: {error}")
+        if not show_notification(title, message):
+            log_debug("[notify] 通知中心消息发送失败")
 
     def open_browser(self, url: str) -> None:
         """在默认浏览器打开 URL (采用 Windows 原生 ShellExecute)"""

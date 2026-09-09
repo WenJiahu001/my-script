@@ -14,12 +14,16 @@ import urllib.parse
 import urllib.request
 
 from config import DATA_DIR, PLUGIN_DIR, get_default_env_key, get_env_config, get_environments, is_env_configured, load_cache, load_views_cache, save_cache, save_views_cache
+from windows_notifications import show_notification
 
 JOB_TREE = "jobs[name,url,color,description,lastBuild[number,result],_class]"
 PARAM_TREE = "property[parameterDefinitions[name,description,defaultParameterValue[value]]]"
 
 
 class JenkinsClient:
+    BUILD_TRACK_INTERVAL_SECONDS = 5
+    BUILD_TRACK_TIMEOUT_SECONDS = 5 * 60
+
     def __init__(self, env_key: str):
         self.env_key = env_key
         self.config = get_env_config(env_key) or {}
@@ -34,6 +38,8 @@ class JenkinsClient:
         self.configured_views = self.config.get("views", []) or []
         self.env_name = str(self.config.get("name", env_key.upper()))
         self._cached_crumb: tuple[str, str] | None = None
+        # 仅保存本次触发获得的队列地址，供入口层启动后台追踪。
+        self.last_queue_url = ""
 
     def _get_auth_header(self) -> dict[str, str]:
         raw_auth = f"{self.username}:{self.api_token}".encode("utf-8")
@@ -200,6 +206,7 @@ class JenkinsClient:
             return False, []
 
     def trigger_build(self, job_url_or_name: str) -> tuple[bool, str]:
+        self.last_queue_url = ""
         valid, message = is_env_configured(self.env_key)
         if not valid:
             return False, message
@@ -223,13 +230,86 @@ class JenkinsClient:
             try:
                 status, _, response_headers = self._request(endpoint, method="POST", data=data, extra_headers=headers)
                 if status in (200, 201, 202):
-                    queue_url = response_headers.get("Location", "")
+                    queue_url = next((str(value) for key, value in response_headers.items() if str(key).lower() == "location"), "")
+                    self.last_queue_url = queue_url
                     return True, f"已成功触发构建！{' (队列: ' + queue_url + ')' if queue_url else ''}"
             except RuntimeError as error:
                 last_error = error
                 if attempt == 0 and (crumb := self.get_crumb(force_refresh=True)):
                     headers[crumb[0]] = crumb[1]
         return False, f"构建失败: {last_error or 'Jenkins 未返回成功状态'}"
+
+    @staticmethod
+    def _format_duration(duration: object) -> str:
+        """将 Jenkins 返回的毫秒耗时转换为易读文本。"""
+        try:
+            total_seconds = max(0, int(duration) // 1000)
+        except (TypeError, ValueError):
+            return "未知"
+        minutes, seconds = divmod(total_seconds, 60)
+        return f"{minutes} 分 {seconds} 秒" if minutes else f"{seconds} 秒"
+
+    @staticmethod
+    def _show_tracking_message(title: str, message: str, icon: int) -> None:
+        """后台子进程独立发送通知中心消息，icon 参数保留兼容现有调用。"""
+        show_notification(title, message)
+
+    def track_build_until_complete(
+        self,
+        job_name: str,
+        queue_url: str,
+        poll_interval_seconds: float | None = None,
+        max_wait_seconds: float | None = None,
+        sleep_fn=time.sleep,
+        monotonic_fn=time.monotonic,
+        notify_fn=None,
+    ) -> None:
+        """追踪单次队列直至构建完成；仅在后台进程调用，绝不阻塞搜索。"""
+        queue_url = str(queue_url or "").rstrip("/")
+        if not queue_url.startswith(("http://", "https://")):
+            return
+        interval = self.BUILD_TRACK_INTERVAL_SECONDS if poll_interval_seconds is None else max(0, poll_interval_seconds)
+        timeout = self.BUILD_TRACK_TIMEOUT_SECONDS if max_wait_seconds is None else max(0, max_wait_seconds)
+        notify = notify_fn or self._show_tracking_message
+        started_at, build_url, last_error = monotonic_fn(), "", ""
+
+        while monotonic_fn() - started_at <= timeout:
+            try:
+                if not build_url:
+                    _, queue_data, _ = self._request(f"{queue_url}/api/json")
+                    if not isinstance(queue_data, dict):
+                        raise RuntimeError("队列状态返回格式异常")
+                    if queue_data.get("cancelled"):
+                        notify("Jenkins 队列已取消", f"【{self.env_name}】项目 [{job_name}]\n该次构建在队列中被取消，未开始执行。", 0x30)
+                        return
+                    executable = queue_data.get("executable")
+                    if isinstance(executable, dict) and executable.get("url"):
+                        build_url = str(executable["url"]).rstrip("/")
+                else:
+                    _, build_data, _ = self._request(f"{build_url}/api/json?tree=building,result,number,duration,url")
+                    if not isinstance(build_data, dict):
+                        raise RuntimeError("构建状态返回格式异常")
+                    result = str(build_data.get("result") or "").upper()
+                    if not build_data.get("building") and result:
+                        number = build_data.get("number", "未知")
+                        duration = self._format_duration(build_data.get("duration"))
+                        actual_url = str(build_data.get("url") or build_url).rstrip("/")
+                        if result == "SUCCESS":
+                            notify("Jenkins 构建完成", f"【{self.env_name}】项目 [{job_name}]\n构建 #{number} 成功，耗时：{duration}。", 0x40)
+                        else:
+                            console_url = f"{actual_url}/console"
+                            notify("Jenkins 构建未成功", f"【{self.env_name}】项目 [{job_name}]\n构建 #{number} 结果：{result}，耗时：{duration}。\n控制台日志：{console_url}", 0x10)
+                        return
+            except RuntimeError as error:
+                # 临时网络波动不应让一次已经入队的构建失去最终反馈。
+                last_error = str(error)
+
+            if interval:
+                sleep_fn(interval)
+
+        target_url = build_url or queue_url
+        error_hint = f"\n最后一次请求错误：{last_error}" if last_error else ""
+        notify("Jenkins 构建跟踪超时", f"【{self.env_name}】项目 [{job_name}]\n超过 5 分钟仍未获取最终结果，请在 Jenkins 中查看。\n地址：{target_url}{error_hint}", 0x30)
 
 
 class JenkinsManager:
@@ -270,6 +350,22 @@ class JenkinsManager:
                 os.unlink(lock_path)
             except FileNotFoundError:
                 pass
+
+    @classmethod
+    def start_build_tracking(cls, env_key: str, job_name: str, queue_url: str) -> bool:
+        """为每次构建启动独立追踪进程，允许同一项目并发构建。"""
+        if not isinstance(queue_url, str) or not queue_url.startswith(("http://", "https://")):
+            return False
+        script = (
+            "from jenkins_client import JenkinsClient\n"
+            f"JenkinsClient({env_key!r}).track_build_until_complete({job_name!r}, {queue_url!r})"
+        )
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(subprocess, "DETACHED_PROCESS", 0)
+        try:
+            subprocess.Popen([sys.executable, "-c", script], cwd=PLUGIN_DIR, creationflags=flags, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return True
+        except OSError:
+            return False
 
     def get_jobs_for_env(self, env_key: str, force_refresh: bool = False) -> tuple[bool, list[dict] | str]:
         return self.get_client(env_key).get_jobs(force_refresh)

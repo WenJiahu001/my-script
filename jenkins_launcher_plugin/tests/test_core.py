@@ -7,8 +7,9 @@ from unittest.mock import patch
 
 import config
 from history import get_job_weight
-from jenkins_client import JenkinsClient
+from jenkins_client import JenkinsClient, JenkinsManager
 from main import JenkinsLauncher
+from windows_notifications import show_notification
 
 
 class ConfigAndClientTests(unittest.TestCase):
@@ -177,6 +178,86 @@ class ConfigAndClientTests(unittest.TestCase):
             launcher.refresh_cache("")
         self.assertEqual(notify.call_args.args[0], "Jenkins 缓存刷新失败")
         self.assertIn("网络超时", notify.call_args.args[1])
+
+    def test_build_tracking_reports_success_after_queue_starts_build(self):
+        client = JenkinsClient.__new__(JenkinsClient)
+        client.env_name = "BETA"
+        build_url = "https://jenkins/job/demo/42"
+        responses = iter([
+            (200, {"executable": {"url": build_url}}, {}),
+            (200, {"building": False, "result": "SUCCESS", "number": 42, "duration": 65000, "url": build_url}, {}),
+        ])
+        client._request = lambda *args, **kwargs: next(responses)
+        notifications = []
+        client.track_build_until_complete("demo", "https://jenkins/queue/item/7/", 0, 60, monotonic_fn=lambda: 0, notify_fn=lambda *args: notifications.append(args))
+        self.assertEqual(notifications[0][0], "Jenkins 构建完成")
+        self.assertIn("构建 #42 成功", notifications[0][1])
+        self.assertIn("1 分 5 秒", notifications[0][1])
+
+    def test_build_tracking_reports_cancelled_queue(self):
+        client = JenkinsClient.__new__(JenkinsClient)
+        client.env_name = "DEV"
+        client._request = lambda *args, **kwargs: (200, {"cancelled": True}, {})
+        notifications = []
+        client.track_build_until_complete("demo", "https://jenkins/queue/item/8/", 0, 60, monotonic_fn=lambda: 0, notify_fn=lambda *args: notifications.append(args))
+        self.assertEqual(notifications[0][0], "Jenkins 队列已取消")
+
+    def test_build_tracking_reports_failed_build_with_console_url(self):
+        client = JenkinsClient.__new__(JenkinsClient)
+        client.env_name = "PROD"
+        build_url = "https://jenkins/job/deploy/9"
+        responses = iter([
+            (200, {"executable": {"url": build_url}}, {}),
+            (200, {"building": False, "result": "ABORTED", "number": 9, "duration": 1000}, {}),
+        ])
+        client._request = lambda *args, **kwargs: next(responses)
+        notifications = []
+        client.track_build_until_complete("deploy", "https://jenkins/queue/item/9/", 0, 60, monotonic_fn=lambda: 0, notify_fn=lambda *args: notifications.append(args))
+        self.assertEqual(notifications[0][0], "Jenkins 构建未成功")
+        self.assertIn("构建 #9 结果：ABORTED", notifications[0][1])
+        self.assertIn(f"{build_url}/console", notifications[0][1])
+
+    def test_build_tracking_reports_timeout(self):
+        client = JenkinsClient.__new__(JenkinsClient)
+        client.env_name = "DEV"
+        notifications = []
+        times = iter([0, 1])
+        client.track_build_until_complete("demo", "https://jenkins/queue/item/10/", 0, 0, monotonic_fn=lambda: next(times), notify_fn=lambda *args: notifications.append(args))
+        self.assertEqual(notifications[0][0], "Jenkins 构建跟踪超时")
+        self.assertIn("超过 5 分钟", notifications[0][1])
+
+    def test_default_build_tracking_timeout_is_five_minutes(self):
+        self.assertEqual(JenkinsClient.BUILD_TRACK_TIMEOUT_SECONDS, 5 * 60)
+
+    def test_empty_queue_url_does_not_start_background_tracking(self):
+        with patch("jenkins_client.subprocess.Popen") as popen:
+            self.assertFalse(JenkinsManager.start_build_tracking("dev", "demo", ""))
+        popen.assert_not_called()
+
+    def test_successful_trigger_starts_background_tracking(self):
+        launcher = JenkinsLauncher.__new__(JenkinsLauncher)
+        client = type("Client", (), {"last_queue_url": "https://jenkins/queue/item/11/", "trigger_build": lambda self, job: (True, "已成功触发构建！")})()
+        launcher.manager = type("Manager", (), {"get_client": lambda self, env: client})()
+        with patch("main.get_env_config", return_value={"name": "DEV", "require_confirm": False}), patch("main.record_job_trigger"), patch("main.JenkinsManager.start_build_tracking", return_value=True) as tracking, patch("main.os.name", "posix"):
+            launcher.build_job("dev", "https://jenkins/job/demo", "demo")
+        tracking.assert_called_once_with("dev", "demo", "https://jenkins/queue/item/11/")
+
+    @unittest.skipUnless(os.name == "nt", "仅验证 Windows 通知中心行为")
+    def test_windows_notification_is_sent_asynchronously(self):
+        with patch("windows_notifications.subprocess.Popen") as popen:
+            self.assertTrue(show_notification("构建完成", "项目 demo 已成功"))
+        command = popen.call_args.args[0]
+        self.assertEqual(command[0], "powershell.exe")
+        self.assertIn("-Sta", command)
+        self.assertIn("-EncodedCommand", command)
+
+    def test_notification_uses_flow_launcher_registered_identity(self):
+        with patch("windows_notifications.subprocess.Popen") as popen:
+            show_notification("构建完成", "项目 demo 已成功")
+        encoded_script = popen.call_args.args[0][-1]
+        script = __import__("base64").b64decode(encoded_script).decode("utf-16le")
+        self.assertIn("Get-StartApps", script)
+        self.assertIn("CreateToastNotifier($flowLauncher.AppID)", script)
 
 
 if __name__ == "__main__":

@@ -4,7 +4,7 @@
   "Name": "Jenkins 一键构建",
   "Description": "快速检索并一键触发 Jenkins 项目默认参数构建",
   "Author": "Antigravity",
-  "Version": "1.0.3",
+  "Version": "1.0.8",
   "Language": "python",
   "Website": "https://github.com",
   "ExecuteFileName": "main.py",
